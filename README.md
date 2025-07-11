@@ -12,7 +12,7 @@ It provides a flexible approach to feature selection across various machine lear
 - **Interpretability**: Provides clear identification of selected features
 
 ## Quick Start
-A quick start guide can be found under the `basic_uses.ipynb` notebook.
+A quick start guide can be found under the `exemples.ipynb` notebook.
 
 ## Available Models
 - `HarderLASSORegressor`: For regression tasks
