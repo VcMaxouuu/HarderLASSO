@@ -25,7 +25,7 @@ All models share these common parameters:
 
 - `hidden_dims`: Tuple of integers specifying the number of neurons in each hidden layer. Use `None` for linear models.
 - `lambda_qut`: Regularization parameter. If `None`, it's determined automatically.
-- `nu`: Regularization parameter controlling the penalty (nu=None for simple l1 penalty and nu=0.1 for non-convex penalty).
+- `penalty`: Sparsity inducing penalty used during training. Can be choosen from `lasso`, `harder` or `scad`.
 
 ## How It Works
 HarderLASSO combines:
