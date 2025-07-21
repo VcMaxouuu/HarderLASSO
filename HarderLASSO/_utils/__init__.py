@@ -4,9 +4,9 @@ Private utility classes and functions for HarderLASSO.
 This module contains internal utilities used by HarderLASSO models.
 """
 
-from ._phase_spec import _PhaseSpec
 from ._normlinear import _NormalizedLinearWrapper
 from ._losses import _RSELoss, _ClassificationLoss, _CoxSquareLoss
+from ._penalties import L1Penalty, HarderPenalty, SCADPenalty, MCPenalty
 from ._cox_utils import (
     survival_analysis_training_info,
     concordance_index,
@@ -16,11 +16,14 @@ from ._cox_utils import (
 )
 
 __all__ = [
-    '_PhaseSpec',
     '_NormalizedLinearWrapper',
     '_RSELoss',
     '_ClassificationLoss',
     '_CoxSquareLoss',
+    'L1Penalty',
+    'HarderPenalty',
+    'SCADPenalty',
+    'MCPenalty',
     'survival_analysis_training_info',
     'concordance_index',
     'cox_partial_log_likelihood',

@@ -46,7 +46,6 @@ class _ConvergenceChecker:
         if torch.isinf(current_loss) or torch.isnan(current_loss):
             return False
 
-        # Compute relative change
         if torch.abs(current_loss) < 1e-12:
             return True
 
@@ -185,7 +184,7 @@ class _LoggingCallback:
         """
         print(f"=== Completed {phase_name}:  Final loss: {final_loss.item():.6f} - Epochs: {epochs} ===")
 
-    def log_convergence(self, epoch: int, tolerance: float) -> None:
+    def log_convergence(self, epoch: int, tolerance) -> None:
         """
         Log convergence information.
 
@@ -193,10 +192,13 @@ class _LoggingCallback:
         ----------
         epoch : int
             Epoch at which convergence was achieved.
-        tolerance : float
-            Tolerance used for convergence check.
+        tolerance : float or str
+            Tolerance used for convergence check or convergence criteria description.
         """
-        print(f"\tConverged at epoch {epoch} (tolerance: {tolerance:.2e})")
+        if isinstance(tolerance, str):
+            print(f"\tConverged at epoch {epoch} ({tolerance})")
+        else:
+            print(f"\tConverged at epoch {epoch} (tolerance: {tolerance:.2e})")
 
     def log_early_stopping(self, epoch: int, reason: str) -> None:
         """

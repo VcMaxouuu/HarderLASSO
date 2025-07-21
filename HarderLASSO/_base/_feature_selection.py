@@ -9,6 +9,7 @@ import torch
 import numpy as np
 import warnings
 from typing import List, Optional, Tuple, Dict, Any, Union
+from HarderLASSO._utils import L1Penalty, HarderPenalty, SCADPenalty, MCPenalty
 
 
 class _FeatureSelectionMixin:
@@ -54,11 +55,11 @@ class _FeatureSelectionMixin:
         ----------
         lambda_qut : float, optional
             Regularization parameter for controlling sparsity.
-        penalty : {'lasso', 'harder', 'scad'}, default='harder'
+        penalty : {'l1', 'harder', 'scad', 'mcp'}, default='harder'
             Type of penalty to apply.
         """
-        if penalty not in ['lasso', 'harder', 'scad']:
-            raise ValueError(f"Penalty must be one of ['lasso', 'harder', 'scad'], got {penalty}")
+        if penalty not in ['l1', 'harder', 'scad', 'mcp']:
+            raise ValueError(f"Penalty must be one of ['l1', 'harder', 'scad', 'mcp'], got {penalty}")
 
         if not hasattr(self, '_neural_network'):
             raise ValueError(
@@ -67,7 +68,17 @@ class _FeatureSelectionMixin:
             )
 
         self.lambda_qut_ = lambda_qut
-        self.penalty = penalty
+
+        if penalty == 'l1':
+            self.penalty = L1Penalty()
+        elif penalty == 'harder':
+            self.penalty = HarderPenalty()
+        elif penalty == 'scad':
+            self.penalty = SCADPenalty()
+        elif penalty == 'mcp':
+            self.penalty = MCPenalty()
+        else:
+            raise ValueError(f"Unsupported penalty type: {penalty}")
 
         # Initialize state
         self.penalized_parameters_ = None
@@ -155,6 +166,29 @@ class _FeatureSelectionMixin:
 
         return coefs
 
+    @property
+    def penalty_value(self) -> Optional[float]:
+        """Get the last computed penalty value.
+
+        This property returns the penalty value from the most recent forward pass
+        or optimization step. Useful for monitoring the regularization term during
+        or after training.
+
+        Returns
+        -------
+        float or None
+            The last computed penalty value, or None if no penalty has been
+            computed yet.
+
+        Examples
+        --------
+        >>> model.fit(X, y)
+        >>> print(f"Final penalty value: {model.penalty_value}")
+        """
+        if hasattr(self, 'penalty') and self.penalty is not None:
+            return self.penalty.last_value
+        return None
+
     def _extract_feature_names(self, X: Union[np.ndarray, Any]) -> List[str]:
         """Extract feature names from input data.
 
@@ -185,62 +219,6 @@ class _FeatureSelectionMixin:
         # Default to string indices
         return [f"feature_{i}" for i in range(X.shape[1])]
 
-    def _compute_regularization_term(self, **reg_kwargs) -> torch.Tensor:
-        """Compute regularization term based on penalty type.
-
-        Parameters
-        ----------
-        **reg_kwargs
-            Regularization parameters including lambda_, nu, a.
-
-        Returns
-        -------
-        torch.Tensor
-            Regularization loss tensor.
-        """
-        if self.penalized_parameters_ is None:
-            return torch.tensor(0.0, requires_grad=True)
-
-        device = next(self._neural_network.parameters()).device
-        lambda_ = reg_kwargs.get('lambda_', self.lambda_qut_)
-
-        if lambda_ == 0 or lambda_ is None:
-            return torch.tensor(0.0, device=device)
-
-        reg_loss = torch.tensor(0.0, device=device, requires_grad=True)
-
-        for param in self.penalized_parameters_:
-            abs_p = param.abs()
-
-            if self.penalty == 'lasso':
-                reg_loss = reg_loss + lambda_ * torch.sum(abs_p)
-
-            elif self.penalty == 'harder':
-                nu = reg_kwargs.get('nu', 0.1)
-                eps = 1e-10
-                abs_p_eps = abs_p + eps
-                pow_term = torch.pow(abs_p_eps, 1 - nu)
-                reg_loss = reg_loss + lambda_ * (abs_p_eps / (1 + pow_term)).sum()
-
-            elif self.penalty == 'scad':
-                a = reg_kwargs.get('a', 3.7)
-
-                # SCAD penalty regions
-                mask1 = abs_p <= lambda_
-                mask2 = (abs_p > lambda_) & (abs_p <= a * lambda_)
-                mask3 = abs_p > a * lambda_
-
-                linear_part = (lambda_ * abs_p[mask1]).sum()
-
-                numer = 2 * a * lambda_ * abs_p - param**2 - lambda_**2
-                quadratic_part = (numer[mask2] / (2 * (a - 1))).sum()
-
-                constant_part = (lambda_**2 * (a + 1) / 2) * mask3.sum()
-
-                reg_loss = reg_loss + linear_part + quadratic_part + constant_part
-
-        return reg_loss
-
     def _identify_parameter_types(self) -> None:
         """Identify which parameters should be penalized.
 
@@ -251,14 +229,12 @@ class _FeatureSelectionMixin:
             raise ValueError("Neural network has not been initialized yet.")
 
         layers = self._neural_network.layers
-        self.penalized_parameters_ = []
+        self.penalized_parameters_ = [layers[0].weight]
         self.unpenalized_parameters_ = []
 
         # All other parameters are not penalized
         for i, layer in enumerate(layers):
-            if i == 0:
-                self.penalized_parameters_.append(layer.weight)
-            else:
+            if i != 0:
                 self.unpenalized_parameters_.append(layer.weight)
 
             # Add bias if present

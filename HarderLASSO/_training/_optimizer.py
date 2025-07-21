@@ -1,19 +1,12 @@
-"""
-FISTA optimizer implementation for HarderLASSO models.
-
-This module provides the FISTA (Fast Iterative Shrinkage-Thresholding Algorithm)
-optimizer for solving sparse optimization problems.
-"""
-
 import torch
+import numpy as np
 from torch.optim.optimizer import Optimizer
-from math import sqrt
-from typing import Callable, Optional, Any, List, Dict
+from typing import Callable, Optional, Any, Dict
 
 
 class _FISTAOptimizer(Optimizer):
     """
-    FISTA optimizer with backtracking line search and monotone restart.
+    FISTA optimizer with backtracking line search and momentum.
 
     This optimizer implements the Fast Iterative Shrinkage-Thresholding Algorithm
     for solving optimization problems of the form:
@@ -22,42 +15,17 @@ class _FISTAOptimizer(Optimizer):
 
     where f(x) is smooth (gradient available) and g(x) is handled by a proximal operator.
 
-    Parameters
-    ----------
-    params : iterable
-        Iterable of parameters to optimize or dicts defining parameter groups.
-    proximal_operator : object
-        Proximal operator for handling the non-smooth term g(x).
-    lr : float, default=0.1
-        Learning rate (step size).
-    lr_decay : float, default=0.5
-        Factor for learning rate decay during line search.
-    min_lr : float, default=1e-7
-        Minimum learning rate.
-
-    Notes
-    -----
-    The closure function should accept a backward parameter and return
-    both the total loss F(x) and the smooth part f(x).
-
-    Examples
-    --------
-    >>> from training.proximal_operator import prox_op_factory
-    >>> prox_op = prox_op_factory(penalty='lasso', lambda_=0.1)
-    >>> optimizer = _FISTAOptimizer(
-    ...     model.parameters(),
-    ...     proximal_operator=prox_op,
-    ...     lr=0.1
-    ... )
+    FISTA uses momentum to accelerate convergence compared to ISTA.
     """
 
     def __init__(
         self,
         params,
-        proximal_operator=None,
+        penalty,
         lr: float = 0.1,
+        lambda_: float = 0.0,
         lr_decay: float = 0.5,
-        min_lr: float = 1e-7
+        min_lr: float = 1e-7,
     ):
         """Initialize the FISTA optimizer."""
         if lr <= 0.0:
@@ -66,193 +34,155 @@ class _FISTAOptimizer(Optimizer):
             raise ValueError(f"Invalid learning rate decay: {lr_decay}")
         if min_lr <= 0.0:
             raise ValueError(f"Invalid minimum learning rate: {min_lr}")
-        if proximal_operator is None:
-            raise ValueError("Proximal operator is required for FISTA")
+        if not hasattr(penalty, 'proximal'):
+            raise ValueError("Penalty function must implement a 'proximal' method for FISTA")
 
         defaults = dict(
-            proximal_operator=proximal_operator,
+            penalty=penalty,
             lr=lr,
+            lambda_=lambda_,
             lr_decay=lr_decay,
-            min_lr=min_lr
+            min_lr=min_lr,
         )
         super().__init__(params, defaults)
 
-        # Initialize algorithm state
+        # Initialize state for each parameter group
         for group in self.param_groups:
-            group['t'] = 1.0
-            group['prev_x'] = [p.data.clone() for p in group['params']]
-            group['y'] = [p.data.clone() for p in group['params']]
-            group['best_loss'] = float('inf')
             group['step_count'] = 0
+            group['converged'] = False
+            group['line_search_failed'] = False  # Track line search failures
+
+            # Initialize momentum state for each parameter
+            for p in group['params']:
+                param_state = self.state[p]
+                param_state['momentum_buffer'] = p.data.clone()  # y_k in FISTA
+                param_state['t'] = 1.0  # momentum coefficient
 
     def step(self, closure: Callable) -> torch.Tensor:
         """
-        Perform a single optimization step.
+        Perform a single FISTA optimization step.
 
-        Parameters
-        ----------
-        closure : callable
-            A closure that reevaluates the model and returns the loss.
-            Must accept backward=True/False parameter.
+        closure should return (total_loss, smooth_loss) when called with backward=True,
+        and return (total_loss, _) when backward=False.
 
-        Returns
-        -------
-        torch.Tensor
-            The current loss value.
+        Returns the total loss at the current iterate (x_k+1) for convergence checking.
         """
         if closure is None:
             raise ValueError("FISTA requires a closure that returns loss and calls backward().")
 
-        # Perform optimization step for each parameter group
+        # Iterate over parameter groups
         for group in self.param_groups:
             self._step_group(group, closure)
 
-        # Return current loss value
+        # Return total loss at current iterate for convergence checking
         return closure(backward=False)
 
     @torch.no_grad()
-    def _set_parameters(self, params: List[torch.Tensor], values: List[torch.Tensor]) -> None:
-        """Set parameter values without gradient tracking."""
-        for param, value in zip(params, values):
-            param.data.copy_(value)
+    def _set_parameters(self, params, values):
+        for p, v in zip(params, values):
+            p.data.copy_(v)
 
     def _step_group(self, group: Dict[str, Any], closure: Callable) -> None:
-        """
-        Perform optimization step for a single parameter group.
-
-        Parameters
-        ----------
-        group : dict
-            Parameter group dictionary.
-        closure : callable
-            Closure function for loss evaluation.
-        """
+        """Perform FISTA step for a parameter group."""
         params = group['params']
-        if not params:
-            return
-
-        # Get optimizer settings
         lr = group['lr']
+        lambda_ = group['lambda_']
         lr_decay = group['lr_decay']
         min_lr = group['min_lr']
-        prox_op = group['proximal_operator']
+        penalty = group['penalty']
 
-        # Set parameters to current y values
-        self._set_parameters(params, group['y'])
+        # Store current iterate x_k
+        x_k = [p.data.clone() for p in params]
 
-        # Evaluate function and gradient at y
+        # Set parameters to momentum point y_k for gradient computation
+        momentum_points = []
+        for p in params:
+            param_state = self.state[p]
+            y_k = param_state['momentum_buffer']
+            momentum_points.append(y_k.clone())
+            p.data.copy_(y_k)
+
+        # Evaluate gradient at momentum point y_k
         total_loss, smooth_loss = closure(backward=True)
-        gradients = [p.grad.clone() for p in params]
+        grads = [p.grad.clone() if p.grad is not None else torch.zeros_like(p) for p in params]
 
-        # Backtracking line search
+        # Backtracking line search starting from momentum point
         current_lr = lr
-        while True:
-            # Compute proximal gradient step
+        new_x = None
+        line_search_success = False
+
+        while current_lr >= min_lr:
+            # Proximal gradient step from momentum point: x_k+1 = prox(y_k - lr * grad_f(y_k))
             new_x = []
-            for y_k, grad_k in zip(group['y'], gradients):
-                v = y_k - current_lr * grad_k
-                new_x.append(prox_op.apply(v, current_lr))
+            for y_k, g_k in zip(momentum_points, grads):
+                v = y_k - current_lr * g_k
+                new_x.append(penalty.proximal(parameter=v, lr=current_lr, lambda_=lambda_))
 
-            # Evaluate function at new point
+            # Set parameters to new iterate and evaluate
             self._set_parameters(params, new_x)
-            new_total_loss, new_smooth_loss = closure(backward=False)
+            new_total, new_smooth = closure(backward=False)
 
-            # Check sufficient decrease condition
-            with torch.no_grad():
-                Q = smooth_loss
-                for y_k, grad_k, x_k in zip(group['y'], gradients, new_x):
-                    diff = x_k - y_k
-                    Q += torch.sum(diff * grad_k)
-                    Q += (1 / (2 * current_lr)) * torch.sum(diff * diff)
+            # Armijo condition at momentum point: f(x_k+1) <= f(y_k) + <grad_f(y_k), x_k+1-y_k> + (1/(2*lr))*||x_k+1-y_k||^2
+            Q = smooth_loss
+            for y_k, g_k, x_new in zip(momentum_points, grads, new_x):
+                diff = x_new - y_k
+                Q += torch.sum(diff * g_k)
+                Q += (1 / (2 * current_lr)) * torch.sum(diff * diff)
 
-            if new_smooth_loss <= Q or current_lr <= min_lr:
+            if new_smooth <= Q:
+                line_search_success = True
                 break
 
             current_lr *= lr_decay
 
+        # Track line search failure for convergence checking
+        group['line_search_failed'] = not line_search_success
+
+        # If line search failed completely, use the last computed step
+        if new_x is None:
+            new_x = []
+            for y_k, g_k in zip(momentum_points, grads):
+                v = y_k - current_lr * g_k
+                new_x.append(penalty.proximal(parameter=v, lr=current_lr, lambda_=lambda_))
+            self._set_parameters(params, new_x)
+
+        # Update momentum for next iteration
+        # FISTA momentum update: t_k+1 = (1 + sqrt(1 + 4*t_k^2)) / 2
+        # y_k+1 = x_k+1 + ((t_k - 1) / t_k+1) * (x_k+1 - x_k)
+        for i, p in enumerate(params):
+            param_state = self.state[p]
+            t_k = param_state['t']
+
+            # Update momentum coefficient
+            t_k_plus_1 = (1 + np.sqrt(1 + 4 * t_k * t_k)) / 2
+            param_state['t'] = t_k_plus_1
+
+            # Update momentum buffer: y_k+1 = x_k+1 + ((t_k - 1) / t_k+1) * (x_k+1 - x_k)
+            x_k_plus_1 = new_x[i]
+            x_k_curr = x_k[i]
+            momentum_coeff = (t_k - 1) / t_k_plus_1
+            param_state['momentum_buffer'] = x_k_plus_1 + momentum_coeff * (x_k_plus_1 - x_k_curr)
+
         group['lr'] = current_lr
-
-        # Monotone restart check
-        if new_total_loss > group['best_loss']:
-            group['t'] = 1.0
-        else:
-            group['best_loss'] = new_total_loss
-
-        # Update FISTA momentum parameter
-        t = group['t']
-        new_t = (1 + sqrt(1 + 4 * t * t)) / 2
-        momentum_coeff = (t - 1) / new_t
-
-        new_y = []
-        for x_k, prev_x_k in zip(new_x, group['prev_x']):
-            y_k = x_k + momentum_coeff * (x_k - prev_x_k)
-            new_y.append(y_k)
-
-        # Update algorithm state
-        group['y'] = new_y
-        group['prev_x'] = [x.clone() for x in new_x]
-        group['t'] = new_t
         group['step_count'] += 1
 
-    def get_lr(self) -> List[float]:
-        """
-        Get current learning rates for all parameter groups.
+    def get_lr(self):
+        """Return current learning rates for each parameter group."""
+        return [g['lr'] for g in self.param_groups]
+
+    def line_search_failed(self) -> bool:
+        """Check if the line search failed in the last step.
+
+        This can be used as a convergence criterion for FISTA, especially
+        when dealing with complex penalties like MCP where the loss might
+        oscillate between FISTA and non-penalized parameter updates.
 
         Returns
         -------
-        list of float
-            Learning rates for each parameter group.
+        bool
+            True if the line search failed to find a valid step size.
         """
-        return [group['lr'] for group in self.param_groups]
+        return any(group.get('line_search_failed', False) for group in self.param_groups)
 
-    def reset(self) -> None:
-        """Reset the optimizer state."""
-        for group in self.param_groups:
-            group['t'] = 1.0
-            group['prev_x'] = [p.data.clone() for p in group['params']]
-            group['y'] = [p.data.clone() for p in group['params']]
-            group['best_loss'] = float('inf')
-            group['step_count'] = 0
-
-    def state_dict(self) -> Dict[str, Any]:
-        """
-        Return the state of the optimizer as a dictionary.
-
-        Returns
-        -------
-        dict
-            State dictionary containing optimizer state.
-        """
-        state = super().state_dict()
-
-        # Add FISTA-specific state
-        for i, group in enumerate(self.param_groups):
-            state['param_groups'][i]['t'] = group['t']
-            state['param_groups'][i]['best_loss'] = group['best_loss']
-            state['param_groups'][i]['step_count'] = group['step_count']
-
-        return state
-
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """
-        Load the optimizer state from a dictionary.
-
-        Parameters
-        ----------
-        state_dict : dict
-            State dictionary to load.
-        """
-        super().load_state_dict(state_dict)
-
-        # Restore FISTA-specific state
-        for i, group in enumerate(self.param_groups):
-            if 't' in state_dict['param_groups'][i]:
-                group['t'] = state_dict['param_groups'][i]['t']
-            if 'best_loss' in state_dict['param_groups'][i]:
-                group['best_loss'] = state_dict['param_groups'][i]['best_loss']
-            if 'step_count' in state_dict['param_groups'][i]:
-                group['step_count'] = state_dict['param_groups'][i]['step_count']
-
-    def __repr__(self) -> str:
-        """String representation of the optimizer."""
-        return f"_FISTAOptimizer(lr={self.defaults['lr']}, lr_decay={self.defaults['lr_decay']})"
+    def __repr__(self):
+        return f"FISTAOptimizer(lr={self.defaults['lr']}, lr_decay={self.defaults['lr_decay']})"

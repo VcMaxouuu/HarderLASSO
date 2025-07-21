@@ -12,7 +12,6 @@ from typing import Optional, Union, List, Tuple, Any, Dict
 from ._network import _NeuralNetwork
 from ._feature_selection import _FeatureSelectionMixin
 from .._training import _FeatureSelectionTrainer, _FISTAOptimizer
-from .._utils import _PhaseSpec
 
 
 class _BaseHarderLASSOModel(_FeatureSelectionMixin):
@@ -79,12 +78,9 @@ class _BaseHarderLASSOModel(_FeatureSelectionMixin):
             Whether to include bias terms.
         lambda_qut : float, optional
             Regularization parameter for controlling sparsity.
-        penalty : {'lasso', 'harder', 'scad'}, default='harder'
+        penalty : {'l1', 'harder', 'scad', 'mcp'}, default='harder'
             Type of penalty to apply.
         """
-        if penalty not in ['lasso', 'harder', 'scad']:
-            raise ValueError(f"Penalty must be one of ['lasso', 'harder', 'scad'], got {penalty}")
-
         # Initialize neural network
         self._neural_network = _NeuralNetwork(hidden_dims, output_dim, bias)
 
@@ -168,105 +164,6 @@ class _BaseHarderLASSOModel(_FeatureSelectionMixin):
         self._neural_network._initialize_layers()
         super()._identify_parameter_types()
 
-    def _create_training_phases(
-        self,
-        X_tensor: torch.Tensor,
-        target_tensor: torch.Tensor,
-        path_values: Optional[List[float]] = None,
-        nu_path: Optional[List[float]] = None
-    ) -> List[_PhaseSpec]:
-        """Create training phases for the multi-phase optimization.
-
-        This method defines the three-phase training strategy including
-        initial Adam optimization, intermediate regularization phases,
-        and final FISTA optimization for sparse solutions.
-
-        Parameters
-        ----------
-        X_tensor : torch.Tensor
-            Input features as tensor.
-        target_tensor : torch.Tensor
-            Target values as tensor.
-        path_values : list of float, optional
-            Custom regularization path. If None, computed automatically.
-        nu_path : list of float, optional
-            Custom nu path for harder penalty. If None, computed automatically.
-
-        Returns
-        -------
-        list of _PhaseSpec
-            List of phase specifications for training.
-        """
-        if not hasattr(self, 'QUT'):
-            raise ValueError("QUT component required for lambda path computation.")
-
-        lambda_path = self.QUT.compute_lambda_path(
-            X_tensor,
-            target_tensor,
-            path_values=path_values,
-            hidden_dims=self._neural_network.hidden_dims,
-            activation=self._neural_network.activation
-        )
-
-        self.lambda_qut_ = self.QUT.lambda_qut_
-
-        if self.penalty == 'harder' and nu_path is None:
-            nu_path = [0.9, 0.7, 0.5, 0.3, 0.2, 0.1]
-
-        # Build training phases
-        phases = []
-        all_parameters = lambda: self._neural_network.parameters()
-
-        # Phase 1: Adam without regularization
-        phases.append(
-            _PhaseSpec(
-                optimizer_class=torch.optim.Adam,
-                parameter_getter=all_parameters,
-                optimizer_kwargs={'lr': 0.1},
-                regularization_kwargs={'lambda_': 0.0, 'penalty': self.penalty},
-                relative_tolerance=1e-4,
-                max_epochs=1000
-            )
-        )
-
-        # Phase 2: Intermediate Adam phases with regularization
-        for i, lambda_val in enumerate(lambda_path[:-1]):
-            reg_kwargs = {'lambda_': lambda_val, 'penalty': self.penalty}
-            if self.penalty == 'harder':
-                reg_kwargs['nu'] = nu_path[i]
-            elif self.penalty == 'scad':
-                reg_kwargs['a'] = 3.7
-
-            phases.append(
-                _PhaseSpec(
-                    optimizer_class=torch.optim.Adam,
-                    parameter_getter=all_parameters,
-                    optimizer_kwargs={'lr': 0.01},
-                    regularization_kwargs=reg_kwargs,
-                    relative_tolerance=1e-6
-                )
-            )
-
-        # Phase 3: Final FISTA phase
-        reg_kwargs = {'lambda_': lambda_path[-1], 'penalty': self.penalty}
-        if self.penalty == 'harder':
-            reg_kwargs['nu'] = nu_path[-1]
-        elif self.penalty == 'scad':
-            reg_kwargs['a'] = 3.7
-
-        phases.append(
-            _PhaseSpec(
-                optimizer_class=_FISTAOptimizer,
-                parameter_getter=lambda: self.penalized_parameters_,
-                optimizer_kwargs={'lr': 0.01},
-                regularization_kwargs=reg_kwargs,
-                relative_tolerance=1e-10
-            )
-        )
-
-        return phases
-
-
     def fit(
         self,
         X: Union[np.ndarray, Any],
@@ -338,13 +235,30 @@ class _BaseHarderLASSOModel(_FeatureSelectionMixin):
         # Setup model architecture
         self._setup_model(X_tensor.shape[1])
 
-        # Create training phases
-        phases = self._create_training_phases(X_tensor, y_tensor, lambda_path, nu_path)
 
-        # Train with multi-phase approach
+        if not hasattr(self, 'QUT'):
+            raise ValueError("QUT component required for lambda path computation.")
+
+        lambda_path = self.QUT.compute_lambda_path(
+            X_tensor,
+            y_tensor,
+            path_values=lambda_path,
+            hidden_dims=self._neural_network.hidden_dims,
+            activation=self._neural_network.activation
+        )
+
+        self.lambda_qut_ = self.QUT.lambda_qut_
+
+        from HarderLASSO._utils import HarderPenalty
+
+        if isinstance(self.penalty, HarderPenalty) and nu_path is None:
+            nu_path = [0.9, 0.7, 0.5, 0.3, 0.2, 0.1]
+
+        # Train with dual optimizer approach
         trainer = _FeatureSelectionTrainer(
             model=self,
-            phases=phases,
+            lambda_path=lambda_path,
+            nu_path=nu_path,
             verbose=verbose,
             logging_interval=logging_interval
         )
@@ -370,7 +284,7 @@ class _BaseHarderLASSOModel(_FeatureSelectionMixin):
         self,
         X: torch.Tensor,
         y: torch.Tensor,
-        learning_rate: float = 0.01,
+        learning_rate: float = 0.1,
         verbose: bool = False,
         logging_interval: int = 50,
         relative_tolerance: float = 1e-5,

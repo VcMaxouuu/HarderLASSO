@@ -6,27 +6,31 @@ the multi-phase training strategy for HarderLASSO models.
 """
 
 import torch
-from typing import List, Any, Callable, Optional
+from typing import List, Any, Callable, Optional, Dict
 from ._optimizer import _FISTAOptimizer
 from ._callbacks import _ConvergenceChecker, _LoggingCallback
-from .._utils import _PhaseSpec
+from .._utils import HarderPenalty, SCADPenalty, MCPenalty
 
 
 class _FeatureSelectionTrainer:
     """
-    Trainer for feature selection models using multi-phase optimization.
+    Trainer for feature selection models using dual optimizer strategy.
 
-    This trainer implements the HarderLASSO training strategy:
-    1. Initial phase: Adam optimizer with no regularization
-    2. Intermediate phases: Adam optimizer with increasing regularization
-    3. Final phase: FISTA optimizer for sparse solution
+    This trainer implements the HarderLASSO training strategy with separate
+    optimizers for penalized and non-penalized parameters:
+    0. Initial phase: No regularization for warm start
+    1. Non-penalized parameters: Single persistent Adam optimizer throughout training
+    2. Penalized parameters: New Adam optimizer for each phase (except final)
+    3. Final phase: FISTA for penalized parameters, Adam continues for non-penalized
 
     Parameters
     ----------
     model : object
         The HarderLASSO model to train.
-    phases : list of _PhaseSpec
-        List of training phase specifications.
+    lambda_path : list of float
+        List of regularization parameters for each phase.
+    nu_path : list of float, optional
+        List of nu parameters for HarderPenalty phases.
     verbose : bool, default=False
         Whether to print training progress.
     logging_interval : int, default=50
@@ -34,27 +38,27 @@ class _FeatureSelectionTrainer:
 
     Examples
     --------
-    >>> phases = [
-    ...     _PhaseSpec(torch.optim.Adam, lambda: model.parameters(), {'lr': 0.1}),
-    ...     _PhaseSpec(_FISTAOptimizer, lambda: model._penalized_parameters, {'lr': 0.01})
-    ... ]
-    >>> trainer = _FeatureSelectionTrainer(model, phases, verbose=True)
+    >>> trainer = _FeatureSelectionTrainer(model, lambda_path=[0.0, 0.1, 0.01], verbose=True)
     >>> trainer.train(X_tensor, y_tensor)
     """
 
     def __init__(
         self,
         model: Any,
-        phases: List[_PhaseSpec],
+        lambda_path: List[float],
+        nu_path: Optional[List[float]] = None,
         verbose: bool = False,
-        logging_interval: int = 50
+        logging_interval: int = 50,
     ):
         """Initialize the feature selection trainer."""
-        if not phases:
-            raise ValueError("At least one training phase must be specified.")
+        if lambda_path is None:
+            raise ValueError("At least one lambda value must be specified.")
 
         self.model = model
-        self.phases = list(phases)
+
+        self.lambda_path = list(lambda_path)
+        self.nu_path = nu_path or []
+
         self.verbose = verbose
         self.logging_interval = logging_interval
 
@@ -63,12 +67,14 @@ class _FeatureSelectionTrainer:
         self.convergence_checker = _ConvergenceChecker()
 
         # Training state
-        self.current_phase = 0
         self.training_history = []
+
+        # Persistent optimizer for non-penalized parameters
+        self.non_penalized_optimizer = None
 
     def train(self, X: torch.Tensor, y: torch.Tensor) -> Any:
         """
-        Train the model using the multi-phase approach.
+        Train the model using the dual optimizer multi-phase approach.
 
         Parameters
         ----------
@@ -85,20 +91,32 @@ class _FeatureSelectionTrainer:
         # Set model to training mode
         self.model._neural_network.train()
 
+        # Initialize persistent optimizer for non-penalized parameters
+        if hasattr(self.model, 'unpenalized_parameters_') and self.model.unpenalized_parameters_:
+            self.non_penalized_optimizer = torch.optim.Adam(
+                self.model.unpenalized_parameters_,
+                lr=0.01
+            )
+
+        # Prepare nu_path for HarderPenalty if needed
+        if isinstance(self.model.penalty, HarderPenalty) and not self.nu_path:
+            raise ValueError(
+                "nu_path must be provided for HarderPenalty. "
+                "If not specified, use the default [0.9, 0.7, 0.5, 0.3, 0.2, 0.1]."
+            )
+
         # Execute each training phase
-        for phase_idx, phase in enumerate(self.phases, 1):
+        for phase_idx in range(len(self.lambda_path)):
+            lambda_val = self.lambda_path[phase_idx]
+            is_final_phase = (phase_idx == len(self.lambda_path) - 1)
+
             if self.verbose:
-                phase_info = self._format_phase_info(phase)
-                self.logger.log_phase_start(f"Phase {phase_idx}/{len(self.phases)}", phase_info)
+                phase_info = self._format_phase_info(phase_idx, lambda_val, is_final_phase)
+                self.logger.log_phase_start(f"Phase {phase_idx + 1}/{len(self.lambda_path)}", phase_info)
 
             # Run the phase
-            phase_history = self._run_phase(X, y, phase, phase_idx)
+            phase_history = self._run_phase(X, y, phase_idx, lambda_val, is_final_phase)
             self.training_history.append(phase_history)
-
-            if self.verbose:
-                final_loss = phase_history['final_loss']
-                epochs = phase_history['epochs']
-                self.logger.log_phase_end(f"Phase {phase_idx}", final_loss, epochs)
 
         return self.model
 
@@ -106,11 +124,12 @@ class _FeatureSelectionTrainer:
         self,
         X: torch.Tensor,
         y: torch.Tensor,
-        phase: _PhaseSpec,
-        phase_idx: int
+        phase_idx: int,
+        lambda_val: float,
+        is_final_phase: bool
     ) -> dict:
         """
-        Run a single training phase.
+        Run a single training phase with dual optimizer strategy.
 
         Parameters
         ----------
@@ -118,48 +137,92 @@ class _FeatureSelectionTrainer:
             Input features tensor.
         y : torch.Tensor
             Target values tensor.
-        phase : _PhaseSpec
-            Phase specification.
         phase_idx : int
-            Phase index for logging.
+            Phase index (0-based).
+        lambda_val : float
+            Regularization parameter for this phase.
+        is_final_phase : bool
+            Whether this is the final phase.
 
         Returns
         -------
         dict
             Dictionary with phase training history.
         """
-        params = list(phase.parameter_getter())
-        if not params:
-            raise ValueError(f"No parameters to optimize in phase {phase_idx}")
+        penalized_params = list(self.model.penalized_parameters_) if self.model.penalized_parameters_ else []
 
-        optimizer = self._create_optimizer(phase, params)
+        # Update penalty parameters for this phase
+        penalty_updates = {'lambda_': lambda_val}
+        if isinstance(self.model.penalty, HarderPenalty) and phase_idx < len(self.nu_path):
+            penalty_updates['nu'] = self.nu_path[phase_idx]
+        elif isinstance(self.model.penalty, SCADPenalty):
+            penalty_updates['a'] = 3.7
+        elif isinstance(self.model.penalty, MCPenalty):
+            penalty_updates['gamma'] = 3
 
-        scheduler = None
-        if not isinstance(optimizer, _FISTAOptimizer):
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', patience=5, factor=0.5, min_lr=1e-10
+        # Update the penalty object with new parameters
+        self.model.penalty.update_params(**penalty_updates)
+
+        # Setup optimizers based on phase type
+        if is_final_phase:
+            if not penalized_params:
+                raise ValueError(f"No penalized parameters found for FISTA phase {phase_idx + 1}")
+
+            penalized_optimizer = _FISTAOptimizer(
+                penalized_params,
+                penalty=self.model.penalty,
+                lr=0.01,
+                lambda_=lambda_val
             )
+        else:
+            lr = 0.1 if phase_idx == 0 else 0.01
+            if penalized_params:
+                penalized_optimizer = torch.optim.Adam(penalized_params, lr=lr)
+            else:
+                penalized_optimizer = None
+
+        non_penalized_optimizer = self.non_penalized_optimizer
+
+        # Setup schedulers
+        penalized_scheduler = None
+        non_penalized_scheduler = None
+
+        if penalized_optimizer and not isinstance(penalized_optimizer, _FISTAOptimizer):
+            penalized_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                penalized_optimizer, mode='min', patience=5, factor=0.5, min_lr=1e-10
+            )
+
+        if non_penalized_optimizer and not is_final_phase:
+            non_penalized_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                non_penalized_optimizer, mode='min', patience=5, factor=0.5, min_lr=1e-10
+            )
+
+        # Set phase-specific tolerances and max epochs
+        if phase_idx == 0:
+            relative_tolerance = 1e-4
+            max_epochs = 1000
+        elif is_final_phase:
+            relative_tolerance = 1e-10
+            max_epochs = None
+        else:
+            relative_tolerance = 1e-6
+            max_epochs = None
 
         # Training loop
         epoch = 0
         last_loss = torch.tensor(float("inf"), device=X.device)
-        phase_history = {
-            'phase_idx': phase_idx,
-            'losses': [],
-            'bare_losses': [],
-            'learning_rates': [],
-            'epochs': 0,
-            'converged': False,
-            'final_loss': None
-        }
 
         def closure(backward: bool = False) -> tuple:
-            optimizer.zero_grad()
+            """Closure function for FISTA optimizer."""
+            if penalized_optimizer:
+                penalized_optimizer.zero_grad()
 
             predictions = self.model.forward(X)
             bare_loss = self.model.criterion(predictions, y)
-            reg_loss = self.model._compute_regularization_term(**phase.regularization_kwargs)
-            total_loss = bare_loss + reg_loss
+            penalty = self.model.penalty.value(
+                parameter=self.model.penalized_parameters_[0]
+            )
+            total_loss = bare_loss + penalty
 
             if backward:
                 bare_loss.backward()
@@ -167,145 +230,117 @@ class _FeatureSelectionTrainer:
             return total_loss, bare_loss
 
         while True:
-            if isinstance(optimizer, _FISTAOptimizer):
-                total_loss, bare_loss = optimizer.step(closure)
+            if is_final_phase and isinstance(penalized_optimizer, _FISTAOptimizer):
+                total_loss, bare_loss = penalized_optimizer.step(closure)
+
             else:
-                optimizer.zero_grad()
+                if penalized_optimizer:
+                    penalized_optimizer.zero_grad()
+                if non_penalized_optimizer:
+                    non_penalized_optimizer.zero_grad()
 
                 predictions = self.model.forward(X)
                 bare_loss = self.model.criterion(predictions, y)
-                reg_loss = self.model._compute_regularization_term(**phase.regularization_kwargs)
-                total_loss = bare_loss + reg_loss
-
+                penalty = self.model.penalty.value(
+                    parameter=self.model.penalized_parameters_[0]
+                )
+                total_loss = bare_loss + penalty
                 total_loss.backward()
-                optimizer.step()
+
+                if penalized_optimizer:
+                    penalized_optimizer.step()
+                if non_penalized_optimizer:
+                    non_penalized_optimizer.step()
+
+            # Check convergence
+            # For FISTA phase, also check if line search failed (indicates convergence)
+            standard_convergence = self.convergence_checker.check_convergence(
+                total_loss, last_loss, relative_tolerance
+            )
+
+            fista_line_search_failed = (
+                is_final_phase and
+                isinstance(penalized_optimizer, _FISTAOptimizer) and
+                penalized_optimizer.line_search_failed()
+            )
+
+            if standard_convergence or fista_line_search_failed:
+                if self.verbose:
+                    if fista_line_search_failed:
+                        self.logger.log_convergence(epoch, "FISTA line search failed - indicating convergence")
+                    else:
+                        self.logger.log_convergence(epoch, relative_tolerance)
+                break
 
             # Log progress
-            current_n_features = self._count_selected_features()
+            current_n_features, _ = self.model._count_nonzero_weights_first_layer()
             self.logger.log(
                 epoch,
                 total_loss.detach(),
                 bare_loss.detach(),
                 self.verbose,
                 n_features=current_n_features,
-                phase_name=f"Phase {phase_idx}"
+                phase_name=f"Phase {phase_idx + 1}"
             )
 
-            # Optional : Record history
-            #   phase_history['losses'].append(total_loss.item())
-            #   phase_history['bare_losses'].append(bare_loss.item())
-            #   if hasattr(optimizer, 'get_lr'):
-            #       phase_history['learning_rates'].append(optimizer.get_lr()[0])
-
-            # Check convergence
-            if self.convergence_checker.check_convergence(
-                total_loss, last_loss, phase.relative_tolerance
-            ):
-                if self.verbose:
-                    self.logger.log_convergence(epoch, phase.relative_tolerance)
-                phase_history['converged'] = True
-                break
-
             # Check maximum epochs
-            if phase.max_epochs and epoch >= phase.max_epochs:
+            if max_epochs and epoch >= max_epochs:
                 if self.verbose:
                     self.logger.log_early_stopping(epoch, "Maximum epochs reached")
                 break
 
             # Update for next iteration
             last_loss = total_loss
-            if scheduler:
-                scheduler.step(total_loss)
+
+            # Update learning rate schedulers
+            if penalized_scheduler:
+                penalized_scheduler.step(total_loss)
+            if non_penalized_scheduler:
+                non_penalized_scheduler.step(total_loss)
+
             epoch += 1
 
-        # Optional - Update history
-        phase_history['epochs'] = epoch
-        phase_history['final_loss'] = total_loss
+        # Return phase history
+        return {"epochs": epoch, "final_loss": total_loss.item()}
 
-        return phase_history
 
-    def _create_optimizer(self, phase: _PhaseSpec, params: List[torch.Tensor]) -> torch.optim.Optimizer:
-        """
-        Create optimizer for a training phase.
-
-        Parameters
-        ----------
-        phase : _PhaseSpec
-            Phase specification.
-        params : list of torch.Tensor
-            Parameters to optimize.
-
-        Returns
-        -------
-        torch.optim.Optimizer
-            Configured optimizer.
-        """
-        if issubclass(phase.optimizer_class, _FISTAOptimizer):
-            # FISTA needs proximal operator
-            from . import _create_proximal_operator
-            prox_op = _create_proximal_operator(**phase.regularization_kwargs)
-
-            # Create parameter groups with proximal operator
-            optimizer = phase.optimizer_class(params, prox_op, **phase.optimizer_kwargs)
-        else:
-            # Standard optimizer
-            optimizer = phase.optimizer_class(params, **phase.optimizer_kwargs)
-
-        return optimizer
-
-    def _format_phase_info(self, phase: _PhaseSpec) -> str:
+    def _format_phase_info(self, phase_idx: int, lambda_val: float, is_final_phase: bool) -> str:
         """
         Format phase information for logging.
 
         Parameters
         ----------
-        phase : _PhaseSpec
-            Phase specification.
+        phase_idx : int
+            Phase index (0-based).
+        lambda_val : float
+            Regularization parameter value.
+        is_final_phase : bool
+            Whether this is the final phase.
 
         Returns
         -------
         str
             Formatted phase information string.
         """
-        optimizer_name = phase.optimizer_class.__name__
+        if is_final_phase:
+            optimizer_name = "FISTA (penalized) + Adam (non-penalized)"
+        elif phase_idx == 0 and lambda_val == 0.0:
+            optimizer_name = "Adam (both parameter groups, no regularization)"
+        elif phase_idx == 0:
+            optimizer_name = "Adam (both parameter groups)"
+        else:
+            optimizer_name = "Adam (new for penalized) + Adam (persistent for non-penalized)"
 
         # Format regularization parameters
-        if phase.regularization_kwargs:
-            reg_info = ", ".join(f"{k}={v}" for k, v in phase.regularization_kwargs.items())
-        else:
+        if lambda_val == 0.0:
             reg_info = "no regularization"
+        else:
+            reg_info = f"lambda={lambda_val}"
+            if isinstance(self.model.penalty, HarderPenalty) and phase_idx < len(self.nu_path):
+                reg_info += f", nu={self.nu_path[phase_idx]}"
+            elif isinstance(self.model.penalty, SCADPenalty):
+                reg_info += ", a=3.7"
+            elif isinstance(self.model.penalty, MCPenalty):
+                reg_info += ", gamma=3"
 
-        return f"{optimizer_name} optimizer, {reg_info}"
-
-    def _count_selected_features(self) -> Optional[int]:
-        """
-        Count the number of currently selected features.
-
-        Returns
-        -------
-        int or None
-            Number of selected features, or None if not available.
-        """
-        try:
-            if hasattr(self.model, '_count_nonzero_weights_first_layer'):
-                count, _ = self.model._count_nonzero_weights_first_layer()
-                return count
-        except:
-            pass
-        return None
-
-    def get_training_history(self) -> List[dict]:
-        """
-        Get the complete training history.
-
-        Returns
-        -------
-        list of dict
-            List of dictionaries containing training history for each phase.
-        """
-        return self.training_history
-
-    def reset(self) -> None:
-        """Reset the trainer state."""
-        self.current_phase = 0
-        self.training_history = []
+        return f"{optimizer_name}, {reg_info}"
