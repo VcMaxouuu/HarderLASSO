@@ -6,11 +6,10 @@ the multi-phase training strategy for HarderLASSO models.
 """
 
 import torch
-from typing import List, Any, Callable, Optional, Dict
-from ._optimizer import _FISTAOptimizer
+from typing import List, Any, Optional
+from ._optimizer import _ISTAOptimizer
 from ._callbacks import _ConvergenceChecker, _LoggingCallback
 from .._utils import HarderPenalty, SCADPenalty, MCPenalty
-
 
 class _FeatureSelectionTrainer:
     """
@@ -21,7 +20,7 @@ class _FeatureSelectionTrainer:
     0. Initial phase: No regularization for warm start
     1. Non-penalized parameters: Single persistent Adam optimizer throughout training
     2. Penalized parameters: New Adam optimizer for each phase (except final)
-    3. Final phase: FISTA for penalized parameters, Adam continues for non-penalized
+    3. Final phase: ISTA for penalized parameters, Adam continues for non-penalized
 
     Parameters
     ----------
@@ -69,9 +68,6 @@ class _FeatureSelectionTrainer:
         # Training state
         self.training_history = []
 
-        # Persistent optimizer for non-penalized parameters
-        self.non_penalized_optimizer = None
-
     def train(self, X: torch.Tensor, y: torch.Tensor) -> Any:
         """
         Train the model using the dual optimizer multi-phase approach.
@@ -91,13 +87,6 @@ class _FeatureSelectionTrainer:
         # Set model to training mode
         self.model._neural_network.train()
 
-        # Initialize persistent optimizer for non-penalized parameters
-        if hasattr(self.model, 'unpenalized_parameters_') and self.model.unpenalized_parameters_:
-            self.non_penalized_optimizer = torch.optim.Adam(
-                self.model.unpenalized_parameters_,
-                lr=0.01
-            )
-
         # Prepare nu_path for HarderPenalty if needed
         if isinstance(self.model.penalty, HarderPenalty) and not self.nu_path:
             raise ValueError(
@@ -105,17 +94,25 @@ class _FeatureSelectionTrainer:
                 "If not specified, use the default [0.9, 0.7, 0.5, 0.3, 0.2, 0.1]."
             )
 
+        if self.verbose:
+            phase_info = self._format_phase_info(phase_idx=-1, lambda_val=0, is_final_phase=False)
+            self.logger.log_phase_start(f"No regularization phase", phase_info)
+
+        # Run the phase
+        phase_history = self._run_phase(X, y, phase_idx=-1, lambda_val=0, is_final_phase=False)
+        self.training_history.append(phase_history)
+
         # Execute each training phase
         for phase_idx in range(len(self.lambda_path)):
             lambda_val = self.lambda_path[phase_idx]
-            is_final_phase = (phase_idx == len(self.lambda_path) - 1)
+            is_final_phase = (phase_idx == len(self.lambda_path)-1)
 
             if self.verbose:
-                phase_info = self._format_phase_info(phase_idx, lambda_val, is_final_phase)
-                self.logger.log_phase_start(f"Phase {phase_idx + 1}/{len(self.lambda_path)}", phase_info)
+                phase_info = self._format_phase_info(phase_idx=phase_idx, lambda_val=lambda_val, is_final_phase=is_final_phase)
+                self.logger.log_phase_start(f"Phase {phase_idx+1}/{len(self.lambda_path)}", phase_info)
 
             # Run the phase
-            phase_history = self._run_phase(X, y, phase_idx, lambda_val, is_final_phase)
+            phase_history = self._run_phase(X, y, phase_idx=phase_idx, lambda_val=lambda_val, is_final_phase=is_final_phase)
             self.training_history.append(phase_history)
 
         return self.model
@@ -149,7 +146,8 @@ class _FeatureSelectionTrainer:
         dict
             Dictionary with phase training history.
         """
-        penalized_params = list(self.model.penalized_parameters_) if self.model.penalized_parameters_ else []
+        penalized_params = list(self.model.penalized_parameters_) if hasattr(self.model, 'penalized_parameters_') else []
+        unpenalized_params = list(self.model.unpenalized_parameters_) if hasattr(self.model, 'unpenalized_parameters_') else []
 
         # Update penalty parameters for this phase
         penalty_updates = {'lambda_': lambda_val}
@@ -163,42 +161,29 @@ class _FeatureSelectionTrainer:
         # Update the penalty object with new parameters
         self.model.penalty.update_params(**penalty_updates)
 
-        # Setup optimizers based on phase type
+        scheduler = None
+
         if is_final_phase:
             if not penalized_params:
-                raise ValueError(f"No penalized parameters found for FISTA phase {phase_idx + 1}")
+                raise ValueError(f"No penalized parameters found for ISTA phase {phase_idx + 1}")
 
-            penalized_optimizer = _FISTAOptimizer(
-                penalized_params,
-                penalty=self.model.penalty,
-                lr=0.01,
-                lambda_=lambda_val
-            )
+            ISTA_optimizer = _ISTAOptimizer([
+                {'params': penalized_params, 'penalty': self.model.penalty},
+                {'params': unpenalized_params}
+            ], lr=0.01, lambda_=lambda_val)
+
         else:
-            lr = 0.1 if phase_idx == 0 else 0.01
-            if penalized_params:
-                penalized_optimizer = torch.optim.Adam(penalized_params, lr=lr)
-            else:
-                penalized_optimizer = None
+            optimizer = torch.optim.Adam(
+                    unpenalized_params + penalized_params,
+                    lr=0.01
+                )
 
-        non_penalized_optimizer = self.non_penalized_optimizer
-
-        # Setup schedulers
-        penalized_scheduler = None
-        non_penalized_scheduler = None
-
-        if penalized_optimizer and not isinstance(penalized_optimizer, _FISTAOptimizer):
-            penalized_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                penalized_optimizer, mode='min', patience=5, factor=0.5, min_lr=1e-10
-            )
-
-        if non_penalized_optimizer and not is_final_phase:
-            non_penalized_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                non_penalized_optimizer, mode='min', patience=5, factor=0.5, min_lr=1e-10
-            )
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer=optimizer, mode='min', patience=5, factor=0.5, min_lr=1e-10
+                )
 
         # Set phase-specific tolerances and max epochs
-        if phase_idx == 0:
+        if phase_idx == -1:
             relative_tolerance = 1e-4
             max_epochs = 1000
         elif is_final_phase:
@@ -213,9 +198,8 @@ class _FeatureSelectionTrainer:
         last_loss = torch.tensor(float("inf"), device=X.device)
 
         def closure(backward: bool = False) -> tuple:
-            """Closure function for FISTA optimizer."""
-            if penalized_optimizer:
-                penalized_optimizer.zero_grad()
+            """Closure function for ISTA optimizer."""
+            ISTA_optimizer.zero_grad()
 
             predictions = self.model.forward(X)
             bare_loss = self.model.criterion(predictions, y)
@@ -230,14 +214,10 @@ class _FeatureSelectionTrainer:
             return total_loss, bare_loss
 
         while True:
-            if is_final_phase and isinstance(penalized_optimizer, _FISTAOptimizer):
-                total_loss, bare_loss = penalized_optimizer.step(closure)
-
+            if is_final_phase and isinstance(ISTA_optimizer, _ISTAOptimizer):
+                total_loss, bare_loss = ISTA_optimizer.step(closure)
             else:
-                if penalized_optimizer:
-                    penalized_optimizer.zero_grad()
-                if non_penalized_optimizer:
-                    non_penalized_optimizer.zero_grad()
+                optimizer.zero_grad()
 
                 predictions = self.model.forward(X)
                 bare_loss = self.model.criterion(predictions, y)
@@ -247,29 +227,11 @@ class _FeatureSelectionTrainer:
                 total_loss = bare_loss + penalty
                 total_loss.backward()
 
-                if penalized_optimizer:
-                    penalized_optimizer.step()
-                if non_penalized_optimizer:
-                    non_penalized_optimizer.step()
+                optimizer.step()
 
-            # Check convergence
-            # For FISTA phase, also check if line search failed (indicates convergence)
-            standard_convergence = self.convergence_checker.check_convergence(
-                total_loss, last_loss, relative_tolerance
-            )
-
-            fista_line_search_failed = (
-                is_final_phase and
-                isinstance(penalized_optimizer, _FISTAOptimizer) and
-                penalized_optimizer.line_search_failed()
-            )
-
-            if standard_convergence or fista_line_search_failed:
+            if self.convergence_checker.check_convergence(total_loss, last_loss, relative_tolerance):
                 if self.verbose:
-                    if fista_line_search_failed:
-                        self.logger.log_convergence(epoch, "FISTA line search failed - indicating convergence")
-                    else:
-                        self.logger.log_convergence(epoch, relative_tolerance)
+                    self.logger.log_convergence(epoch, relative_tolerance)
                 break
 
             # Log progress
@@ -293,10 +255,8 @@ class _FeatureSelectionTrainer:
             last_loss = total_loss
 
             # Update learning rate schedulers
-            if penalized_scheduler:
-                penalized_scheduler.step(total_loss)
-            if non_penalized_scheduler:
-                non_penalized_scheduler.step(total_loss)
+            if scheduler:
+                scheduler.step(total_loss)
 
             epoch += 1
 
@@ -323,13 +283,9 @@ class _FeatureSelectionTrainer:
             Formatted phase information string.
         """
         if is_final_phase:
-            optimizer_name = "FISTA (penalized) + Adam (non-penalized)"
-        elif phase_idx == 0 and lambda_val == 0.0:
-            optimizer_name = "Adam (both parameter groups, no regularization)"
-        elif phase_idx == 0:
-            optimizer_name = "Adam (both parameter groups)"
+            optimizer_name = "ISTA (penalized)"
         else:
-            optimizer_name = "Adam (new for penalized) + Adam (persistent for non-penalized)"
+            optimizer_name = "Adam (both parameter groups)"
 
         # Format regularization parameters
         if lambda_val == 0.0:

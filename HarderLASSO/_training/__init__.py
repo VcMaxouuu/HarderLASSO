@@ -6,14 +6,12 @@ trainers, and callbacks.
 """
 
 from ._trainer import _FeatureSelectionTrainer
-from ._optimizer import _FISTAOptimizer
+from ._optimizer import _ISTAOptimizer
 from ._callbacks import _ConvergenceChecker, _LoggingCallback
-from ._proximal import _create_proximal_operator
 
 __all__ = [
     '_FeatureSelectionTrainer',
-    '_FISTAOptimizer',
+    '_ISTAOptimizer',
     '_ConvergenceChecker',
-    '_LoggingCallback',
-    '_create_proximal_operator'
+    '_LoggingCallback'
 ]

@@ -7,8 +7,7 @@ model types for various tasks.
 
 import torch
 import torch.nn as nn
-import math
-from typing import Optional, Literal
+from typing import Literal
 
 
 class _BaseLoss(nn.Module):
@@ -111,6 +110,57 @@ class _ClassificationLoss(_BaseLoss):
             Cross-entropy loss.
         """
         return self.cross_entropy(input, target)
+
+
+class _ClassificationLossBinary(_BaseLoss):
+    """
+    Binary cross-entropy loss for binary classification tasks.
+
+    This is a wrapper around PyTorch's BCEWithLogitsLoss with consistent
+    interface for HarderLASSO models.
+
+    Parameters
+    ----------
+    reduction : str, default='mean'
+        Reduction method ('mean', 'sum', or 'none').
+
+    Examples
+    --------
+    >>> loss_fn = _ClassificationLossBinary()
+    >>> predictions = torch.randn(32, 1)  # Binary logits
+    >>> targets = torch.randint(0, 2, (32,))
+    >>> loss = loss_fn(predictions, targets)
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        """Initialize binary classification loss function."""
+        super().__init__(reduction)
+        self.bce_loss = nn.BCELoss(reduction=reduction)
+
+    def mapping_function(self, x: torch.Tensor) -> torch.Tensor:
+        res = 0.5*(1+torch.sin(x))
+        mask = (x > -torch.pi/2) & (x < torch.pi/2)
+        res[~mask] = torch.sigmoid(5 * x[~mask])
+        return res
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the binary cross-entropy loss.
+
+        Parameters
+        ----------
+        input : torch.Tensor
+            Predicted logits of shape (batch_size, 1).
+        target : torch.Tensor
+            True binary labels of shape (batch_size,).
+
+        Returns
+        -------
+        torch.Tensor
+            Binary cross-entropy loss.
+        """
+        probs = self.mapping_function(input.squeeze())
+        return self.bce_loss(probs, target)
 
 
 class _CoxSquareLoss(_BaseLoss):

@@ -169,7 +169,7 @@ class HarderPenalty(BasePenalty):
         """
 
         def func(x, y, reg):
-            return x - abs(y) + reg * (1 + nu * x**(1 - nu)) / (1 + x**(1 - nu))**2
+            return x - abs(y) + reg * ((1 + nu * x**(1 - nu)) / (1 + x**(1 - nu))**2)
 
         def fprime(x, y, reg):
             numerator = (1 - nu) * (2 + nu * x**(1 - nu) - nu)
@@ -273,7 +273,7 @@ class SCADPenalty(BasePenalty):
         constant_part = ((lambda_**2 * (a + 1) / 2) * mask3).sum()
 
         reg_loss = linear_part + quadratic_part + constant_part
-        self._last_value = reg_loss  # Store the computed value
+        self._last_value = reg_loss
         return reg_loss
 
     def proximal(self, parameter, **kwargs):
@@ -330,15 +330,13 @@ class MCPenalty(BasePenalty):
         gamma = kwargs.get('gamma', self.params.get('gamma', 3.0))
 
         abs_p = parameter.abs()
-        reg_loss = 0.0
-
         mask = abs_p <= lambda_ * gamma
 
         part1 = (lambda_ * abs_p[mask] - (parameter[mask]**2)/(2*gamma)).sum()
-        part2 = (gamma * lambda_**2 / 2) * (~mask).sum()
+        part2 = ((gamma * lambda_**2) / 2) * (~mask).sum()
 
         reg_loss = part1 + part2
-        self._last_value = reg_loss  # Store the computed value
+        self._last_value = reg_loss
         return reg_loss
 
     def proximal(self, parameter, **kwargs):
@@ -352,17 +350,9 @@ class MCPenalty(BasePenalty):
         if lr_lambda == 0:
             return parameter
 
-        result = torch.zeros_like(parameter)
-        abs_u = parameter.abs()
-
-        # Region 1: |u| > threshold * gamma -> no shrinkage
-        mask1 = abs_u > lr_lambda * gamma
-        result[mask1] = parameter[mask1]
-
-        # Region 2: threshold < |u| <= gamma*threshold
-        mask2 = (abs_u > lr_lambda) & (abs_u <= gamma * lr_lambda)
-        result[mask2] = (torch.sign(parameter[mask2]) * (abs_u[mask2] - lr_lambda))/(1 - 1/gamma)
-
+        result = parameter.clone()
+        mask = result.abs() <= lr_lambda * gamma
+        result[mask] = (gamma/(gamma-1)) * (torch.sign(parameter[mask]) * torch.relu(parameter[mask].abs() - lr_lambda))
         return result
 
     def __str__(self):
@@ -370,3 +360,106 @@ class MCPenalty(BasePenalty):
 
     def __repr__(self):
         return f"MCPenalty(lambda_={self.params.get('lambda_', 0.0)}, gamma={self.params.get('gamma', 3.0)})"
+
+
+
+class TanhPenalty(BasePenalty):
+    """
+    Class to compute the tanh penalty for a given parameter.
+    """
+    def __init__(self, lambda_=0.0):
+        """Initialize tanh penalty.
+
+        Parameters
+        ----------
+        lambda_ : float, default=0.0
+            Regularization parameter.
+        """
+        super().__init__(lambda_=lambda_)
+
+    def value(self, parameter, **kwargs):
+        # Use stored parameters if not provided in kwargs
+        lambda_ = kwargs.get('lambda_', self.params.get('lambda_', 0))
+
+        penalty_value = lambda_ * (parameter.tanh().abs()).sum()
+        self._last_value = penalty_value  # Store the computed value
+        return penalty_value
+
+    def _solve_nonzero(self, u_val: float, lr_lambda: float) -> float:
+        """
+        Solve for non-zero solution in tanh penalty.
+
+        Parameters
+        ----------
+        u_val : float
+            Input value.
+        lr_lambda : float
+            lambda * step_size.
+
+        Returns
+        -------
+        float
+            Solution value.
+        """
+
+        def func(x, y, reg):
+            return x - abs(y) + reg * (1 - np.tanh(x)**2)
+
+        def fprime(x, y, reg):
+            return 1 - 2 * reg * np.tanh(x) * (1 - np.tanh(x)**2)
+
+        try:
+            root = newton(
+                func,
+                x0=abs(u_val),
+                fprime=fprime,
+                args=(u_val, lr_lambda),
+                maxiter=500,
+                tol=1e-5
+            )
+            return root * np.sign(u_val)
+
+        except RuntimeError:
+            warnings.warn(
+                "Newton-Raphson did not converge for Harder penalty. "
+                "Using soft-thresholding approximation.",
+                RuntimeWarning
+            )
+            # Fallback to soft thresholding
+            return np.sign(u_val) * max(0, abs(u_val) - lr_lambda)
+
+    def proximal(self, parameter, **kwargs):
+        # Use stored parameters if not provided in kwargs
+        lambda_ = kwargs.get('lambda_', self.params.get('lambda_', 0))
+        lr = kwargs.get('lr', 0.01)
+
+        lr_lambda = lambda_ * lr
+
+        if lr_lambda == 0:
+            return parameter
+
+        # Solve for non-zero values
+        result = torch.zeros_like(parameter)
+        abs_u = parameter.abs()
+
+        mask = abs_u > lr_lambda
+
+        if not mask.any():
+            return result
+
+        # Solve for non-zero values
+        u_selected = parameter[mask].cpu().numpy()
+        solutions = torch.tensor(
+            self._solve_nonzero(u_selected, lr_lambda),
+            dtype=parameter.dtype,
+            device=parameter.device
+        )
+        result[mask] = solutions
+
+        return result
+
+    def __str__(self):
+        return "Tanh Penalty"
+
+    def __repr__(self):
+        return f"TanhPenalty(lambda_={self.params.get('lambda_', 0.0)})"

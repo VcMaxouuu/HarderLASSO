@@ -52,19 +52,12 @@ class _RegressionQUT(_BaseQUTMixin):
             Simulated QUT values of shape (n_reps,)
         """
         device, dtype = X.device, X.dtype
-        n_samples, _ = X.shape
-
-        # Generate centered Gaussian noise
-        y_sample = torch.randn(n_samples, n_reps, dtype=dtype, device=device)
-        y_centered = y_sample - y_sample.mean(dim=0, keepdim=True)
-
-        # Compute X^T * y for each repetition
-        Xy = torch.matmul(X.T, y_centered)
-        Xy_inf_norm = torch.abs(Xy).amax(dim=0)
-        y_norm = y_centered.norm(p=2, dim=0)
-
-        return Xy_inf_norm / y_norm
-
+        n = X.shape[0]
+        y = torch.randn(n, n_reps, device=device, dtype=dtype)
+        y.sub_(y.mean(dim=0, keepdim=True))
+        numer = torch.linalg.norm(X.T @ y, ord=float("inf"), dim=0)
+        denom = torch.linalg.norm(y, ord=2, dim=0)
+        return numer / denom
 
 class _ClassificationQUT(_BaseQUTMixin):
     """QUT manager for classification tasks.
@@ -87,6 +80,19 @@ class _ClassificationQUT(_BaseQUTMixin):
     ) -> None:
         """Initialize the classification QUT manager."""
         super().__init__(lambda_qut, n_samples, alpha)
+        self.n_classes = None
+
+    def _compute_n_classes(self, target: torch.Tensor) -> int:
+        """Compute the number of classes from target labels.
+
+        Args:
+            target: Target labels of shape (n_samples,)
+
+        Returns:
+            Number of unique classes.
+        """
+        self.n_classes = target.unique().numel()
+        return self.n_classes
 
     def _compute_class_distribution(self, target: torch.Tensor) -> torch.Tensor:
         """Compute empirical class distribution from target labels.
@@ -97,8 +103,7 @@ class _ClassificationQUT(_BaseQUTMixin):
         Returns:
             Class probabilities of shape (n_classes,)
         """
-        num_classes = target.unique().numel()
-        counts = torch.bincount(target, minlength=num_classes).float()
+        counts = torch.bincount(target, minlength=self._compute_n_classes(target)).float()
         return counts / target.size(0)
 
     def _simulation_method(
@@ -118,30 +123,24 @@ class _ClassificationQUT(_BaseQUTMixin):
             Simulated QUT values of shape (n_reps,)
         """
         device, dtype = X.device, X.dtype
+        n = X.shape[0]
         hat_p = self._compute_class_distribution(target).to(device=device, dtype=dtype)
-
-        # Sample from multinomial distribution
-        y_sample_indices = torch.multinomial(
+        #hat_p = torch.tensor([0.5, 0.5], device=device, dtype=dtype)
+        y = torch.multinomial(
             hat_p, X.shape[0] * n_reps, replacement=True
-        )
-        y_sample_indices = y_sample_indices.reshape(n_reps, X.shape[0])
+        ).reshape(n_reps, X.shape[0])
 
-        # Convert to one-hot encoding
-        num_classes = len(hat_p)
-        y_sample_one_hot = torch.nn.functional.one_hot(
-            y_sample_indices, num_classes=num_classes
+        y = torch.nn.functional.one_hot(
+            y, num_classes=self.n_classes
         ).float()
+        y.sub_(y.mean(dim=1, keepdim=True))
 
-        # Center the samples
-        y_centered = y_sample_one_hot - y_sample_one_hot.mean(dim=1, keepdim=True)
+        xy = torch.einsum('ij,rjk->rik', X.T, y)
+        l = xy.abs().sum(dim=2).max(dim=1)[0]
 
-        # Compute X^T * y for each repetition and class
-        xy = torch.einsum('ij,rjk->rik', X.T, y_centered)
-        xy_sum = torch.abs(xy).sum(dim=2)
-        l = xy_sum.max(dim=1)[0]
-
+        #ybar = y_mean[..., 1].squeeze()
+        #l = l / torch.sqrt(ybar * (1-ybar))
         return l
-
 
 class _CoxQUT(_BaseQUTMixin):
     """QUT manager for Cox regression tasks.
@@ -180,9 +179,13 @@ class _CoxQUT(_BaseQUTMixin):
 
         Returns:
             Simulated QUT values of shape (n_reps,)
-        """
+
+
+
+        Code for sorted X at each rep:
+
         device, dtype = X.device, X.dtype
-        n_samples, _ = X.shape
+        n_samples, n_feat = X.shape
         times = target[:, 0]
         events = target[:, 1]
 
@@ -193,20 +196,43 @@ class _CoxQUT(_BaseQUTMixin):
         times_boot = times[pair_boot_idx]
         events_boot = events[pair_boot_idx]  # (n_samples, n_reps)
 
+        sorted_idx = torch.argsort(times_boot, dim=0, descending=True)
+        events = events_boot.gather(0, sorted_idx)
+        X = X.unsqueeze(2).expand(n_samples, n_feat, n_reps).gather(0, sorted_idx.unsqueeze(1).expand(-1, n_feat, -1))
+
         # Compute cumulative statistics
-        counts = torch.arange(1, n_samples + 1, dtype=dtype, device=device).unsqueeze(1)
-        cumsums_mean = X.cumsum(0).div(counts)  # (n_samples, n_features)
-        X_diff = X - cumsums_mean  # (n_samples, n_features)
+        counts = torch.arange(1, n_samples + 1, dtype=dtype, device=device)
+        X.sub_(X.cumsum(0) / counts.view(-1, 1, 1))
 
         # Compute gradient components
-        grad_nom = -(X_diff.unsqueeze(1) * events_boot.unsqueeze(2)).sum(dim=0)
-        grad_denom = (
-            events_boot * torch.log(counts.squeeze(1)).unsqueeze(1)
-        ).sum(0).sqrt().mul(2)
+        grad_nom = torch.linalg.norm((events.unsqueeze(1) * X).sum(0), ord=float("inf"), dim=0)
+        grad_denom = 2 * (events.T.matmul(torch.log(counts))).sqrt()
 
-        quotient = grad_nom / (grad_denom + 1e-10).unsqueeze(1)
+        quotient = grad_nom / grad_denom.add(1e-10)
+        return quotient
+        """
+        device, dtype = X.device, X.dtype
+        n_samples, _ = X.shape
+        times = target[:, 0]
+        events = target[:, 1]
 
-        return quotient.abs().amax(1)
+        pair_boot_idx = torch.randint(
+            0, n_samples, (n_samples, n_reps), dtype=torch.long, device=device
+        )
+        times_boot = times[pair_boot_idx]
+        events_boot = events[pair_boot_idx]
+
+        sorted_idx = torch.argsort(times_boot, dim=0, descending=True)
+        events = events_boot.gather(0, sorted_idx)
+
+        counts = torch.arange(1, n_samples + 1, dtype=dtype, device=device)
+        X.sub_(X.cumsum(0) / counts.view(-1, 1))
+
+        grad_nom = torch.linalg.norm(events.T @ X, ord=float("inf"), dim=1)
+        grad_denom = 2 * (events.T.matmul(torch.log(counts))).sqrt()
+
+        quotient = grad_nom / grad_denom.add(1e-10)
+        return quotient
 
 
 class _GumbelQUT(_BaseQUTMixin):

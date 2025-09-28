@@ -8,10 +8,10 @@ using the HarderLASSO methodology.
 
 import torch
 import numpy as np
-from typing import Optional, Union, List, Tuple, Any, Dict
+from typing import Optional, Union, List, Tuple, Any
 from ._network import _NeuralNetwork
 from ._feature_selection import _FeatureSelectionMixin
-from .._training import _FeatureSelectionTrainer, _FISTAOptimizer
+from .._training import _FeatureSelectionTrainer
 
 
 class _BaseHarderLASSOModel(_FeatureSelectionMixin):
@@ -29,18 +29,15 @@ class _BaseHarderLASSOModel(_FeatureSelectionMixin):
         Number of output features. Must be positive integer.
     bias : bool, default=True
         Whether to include bias terms in the neural network layers.
-    lambda_qut : float, optional
-        Regularization parameter for controlling sparsity. If None, computed
-        automatically using QUT methodology.
     penalty : {'lasso', 'harder', 'scad'}, default='harder'
         Type of penalty to apply.
+    activation : nn.Module, optional
+        Activation function to use in hidden layers. Defaults to nn.ReLU().
 
     Attributes
     ----------
     _neural_network : _NeuralNetwork
         The underlying neural network architecture.
-    lambda_qut_ : float
-        Computed regularization parameter after fitting.
     selected_features_indices_ : list
         Indices of selected features after fitting.
     feature_names_in_ : list
@@ -63,8 +60,8 @@ class _BaseHarderLASSOModel(_FeatureSelectionMixin):
         hidden_dims: Optional[Tuple[int, ...]] = (20,),
         output_dim: int = 1,
         bias: bool = True,
-        lambda_qut: Optional[float] = None,
-        penalty: str = 'harder'
+        penalty: str = 'harder',
+        activation: Optional[torch.nn.Module] = None
     ):
         """Initialize the base HarderLASSO model.
 
@@ -76,16 +73,16 @@ class _BaseHarderLASSOModel(_FeatureSelectionMixin):
             Number of output features.
         bias : bool, default=True
             Whether to include bias terms.
-        lambda_qut : float, optional
-            Regularization parameter for controlling sparsity.
         penalty : {'l1', 'harder', 'scad', 'mcp'}, default='harder'
             Type of penalty to apply.
+        activation : nn.Module, optional
+            Activation function to use in hidden layers. Defaults to ReLU.
         """
         # Initialize neural network
-        self._neural_network = _NeuralNetwork(hidden_dims, output_dim, bias)
+        self._neural_network = _NeuralNetwork(hidden_dims, output_dim, bias, activation)
 
         # Initialize feature selection mixin
-        super().__init__(lambda_qut=lambda_qut, penalty=penalty)
+        super().__init__(penalty=penalty)
 
         # Training state
         self._is_fitted = False
@@ -278,6 +275,7 @@ class _BaseHarderLASSOModel(_FeatureSelectionMixin):
         )
 
         self._is_fitted = True
+
         return self
 
     def _train_without_regularization(

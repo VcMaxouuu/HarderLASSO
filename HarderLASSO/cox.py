@@ -5,10 +5,11 @@ learning with feature selection using the HarderLASSO regularization method
 for survival analysis tasks.
 """
 
-from typing import Optional, Tuple, Dict, Any, Union, List
+from typing import Optional, Tuple, Union, List
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from numpy import ndarray
 
 from ._base import _BaseHarderLASSOModel
@@ -55,10 +56,10 @@ class HarderLASSOCox(_BaseHarderLASSOModel, _CoxTaskMixin):
         automatically using QUT.
     penalty : {'harder', 'lasso', 'scad'}, default='harder'
         Type of penalty function for regularization.
+    activation : nn.Module, optional
+        Activation function to use in the neural network. Defaults to ReLU.
     approximation : {'Breslow', 'Efron'}, default='Breslow'
         Method for handling tied event times.
-    bias : bool, default=False
-        Whether to include bias terms in neural network layers.
 
     Attributes
     ----------
@@ -113,7 +114,9 @@ class HarderLASSOCox(_BaseHarderLASSOModel, _CoxTaskMixin):
         hidden_dims: Tuple[int, ...] = (20,),
         lambda_qut: Optional[float] = None,
         penalty: str = 'harder',
-        approximation: str = 'Breslow'
+        activation: Optional[nn.Module] = nn.ReLU(),
+        approximation: str = 'Breslow',
+        alpha: float = 0.05
     ) -> None:
         """Initialize the HarderLASSO Cox regression model.
 
@@ -125,8 +128,12 @@ class HarderLASSOCox(_BaseHarderLASSOModel, _CoxTaskMixin):
             Regularization parameter for feature selection.
         penalty : {'harder', 'lasso', 'ridge'}, default='harder'
             Type of regularization to apply.
+        activation : nn.Module, optional
+            Activation function to use in the neural network. Defaults to ReLU.
         approximation : {'Breslow', 'Efron'}, default='Breslow'
             Method for handling tied event times.
+        alpha: float, default=0.05
+            Significance level for QUT computation.
         """
         # Initialize base model
         _BaseHarderLASSOModel.__init__(
@@ -134,8 +141,8 @@ class HarderLASSOCox(_BaseHarderLASSOModel, _CoxTaskMixin):
             hidden_dims=hidden_dims,
             output_dim=1,
             bias=False,
-            lambda_qut=lambda_qut,
-            penalty=penalty
+            penalty=penalty,
+            activation=activation
         )
 
         # Initialize task-specific functionality
@@ -143,8 +150,10 @@ class HarderLASSOCox(_BaseHarderLASSOModel, _CoxTaskMixin):
 
         # Initialize QUT manager
         self.QUT = _CoxQUT(
-            lambda_qut=lambda_qut
+            lambda_qut=lambda_qut,
+            alpha=alpha
         )
+        self.lambda_qut_ = lambda_qut
 
     @property
     def baseline_hazard_(self) -> pd.DataFrame:
@@ -287,7 +296,6 @@ class HarderLASSOCox(_BaseHarderLASSOModel, _CoxTaskMixin):
         features = self.selected_features_
         s = len(features)
         n_rows = 1 + ceil((s) / 2)
-
 
         fig, axes = plt.subplots(n_rows, 2, figsize=(12, 4 * n_rows), squeeze=False)
         fig.suptitle('HarderLASSO Survival Diagnostics', fontsize=16)

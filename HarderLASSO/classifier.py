@@ -6,6 +6,7 @@ for classification tasks.
 """
 
 from typing import Optional, Tuple
+from torch import nn
 from ._base import _BaseHarderLASSOModel
 from ._tasks import _ClassificationTaskMixin
 from ._qut import _ClassificationQUT
@@ -39,6 +40,8 @@ class HarderLASSOClassifier(_BaseHarderLASSOModel, _ClassificationTaskMixin):
         automatically using QUT.
     penalty : {'harder', 'lasso', 'scad'}, default='harder'
         Type of penalty function for regularization.
+    activation : nn.Module, optional
+        Activation function to use in hidden layers. Defaults to nn.ReLU().
 
     Attributes
     ----------
@@ -81,7 +84,9 @@ class HarderLASSOClassifier(_BaseHarderLASSOModel, _ClassificationTaskMixin):
         self,
         hidden_dims: Tuple[int, ...] = (20,),
         lambda_qut: Optional[float] = None,
-        penalty: str = 'harder'
+        penalty: str = 'harder',
+        activation: Optional[nn.Module] = nn.ReLU(),
+        alpha: float = 0.05
     ) -> None:
         """Initialize the HarderLASSO classifier.
 
@@ -93,6 +98,10 @@ class HarderLASSOClassifier(_BaseHarderLASSOModel, _ClassificationTaskMixin):
             Regularization parameter for feature selection.
         penalty : {'harder', 'lasso', 'ridge'}, default='harder'
             Type of regularization to apply.
+        activation : nn.Module, optional
+            Activation function to use in hidden layers. Defaults to nn.ReLU().
+        alpha: float, default=0.05
+            Significance level for QUT computation.
         """
         # Initialize base model
         _BaseHarderLASSOModel.__init__(
@@ -100,15 +109,15 @@ class HarderLASSOClassifier(_BaseHarderLASSOModel, _ClassificationTaskMixin):
             hidden_dims=hidden_dims,
             output_dim=None,  # Will be set automatically based on data
             bias=True,
-            lambda_qut=lambda_qut,
-            penalty=penalty
+            penalty=penalty,
+            activation=activation
         )
 
         # Initialize task-specific functionality
         _ClassificationTaskMixin.__init__(self)
 
         # Initialize QUT manager
-        self.QUT = _ClassificationQUT(lambda_qut=lambda_qut)
+        self.QUT = _ClassificationQUT(lambda_qut=lambda_qut, alpha=alpha)
 
     def __repr__(self) -> str:
         """Return string representation of the classifier."""

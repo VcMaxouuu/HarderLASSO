@@ -9,7 +9,7 @@ import torch
 import numpy as np
 import warnings
 from typing import List, Optional, Tuple, Dict, Any, Union
-from HarderLASSO._utils import L1Penalty, HarderPenalty, SCADPenalty, MCPenalty
+from HarderLASSO._utils import L1Penalty, HarderPenalty, SCADPenalty, MCPenalty, TanhPenalty
 
 
 class _FeatureSelectionMixin:
@@ -29,8 +29,6 @@ class _FeatureSelectionMixin:
 
     Attributes
     ----------
-    lambda_qut_ : float
-        Regularization parameter value.
     penalty : str
         Type of penalty function used.
     selected_features_indices_ : list
@@ -48,26 +46,22 @@ class _FeatureSelectionMixin:
     Use the public HarderLASSO classes instead.
     """
 
-    def __init__(self, lambda_qut: Optional[float] = None, penalty: str = 'harder'):
+    def __init__(self, penalty: str = 'harder'):
         """Initialize the feature selection mixin.
 
         Parameters
         ----------
-        lambda_qut : float, optional
-            Regularization parameter for controlling sparsity.
-        penalty : {'l1', 'harder', 'scad', 'mcp'}, default='harder'
+        penalty : {'l1', 'harder', 'scad', 'mcp', 'tanh'}, default='harder'
             Type of penalty to apply.
         """
-        if penalty not in ['l1', 'harder', 'scad', 'mcp']:
-            raise ValueError(f"Penalty must be one of ['l1', 'harder', 'scad', 'mcp'], got {penalty}")
+        if penalty not in ['l1', 'harder', 'scad', 'mcp', 'tanh']:
+            raise ValueError(f"Penalty must be one of ['l1', 'harder', 'scad', 'mcp', 'tanh'], got {penalty}")
 
         if not hasattr(self, '_neural_network'):
             raise ValueError(
                 "_FeatureSelectionMixin can only be used with classes that have "
                 "a '_neural_network' attribute."
             )
-
-        self.lambda_qut_ = lambda_qut
 
         if penalty == 'l1':
             self.penalty = L1Penalty()
@@ -77,6 +71,8 @@ class _FeatureSelectionMixin:
             self.penalty = SCADPenalty()
         elif penalty == 'mcp':
             self.penalty = MCPenalty()
+        elif penalty == 'tanh':
+            self.penalty = TanhPenalty()
         else:
             raise ValueError(f"Unsupported penalty type: {penalty}")
 
@@ -186,7 +182,7 @@ class _FeatureSelectionMixin:
         >>> print(f"Final penalty value: {model.penalty_value}")
         """
         if hasattr(self, 'penalty') and self.penalty is not None:
-            return self.penalty.last_value
+            return self.penalty.last_value.item()
         return None
 
     def _extract_feature_names(self, X: Union[np.ndarray, Any]) -> List[str]:

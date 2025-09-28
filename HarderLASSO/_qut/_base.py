@@ -10,41 +10,6 @@ import numpy as np
 import torch
 
 
-def _function_derivative(func: Callable, u: torch.Tensor) -> float:
-    """
-    Compute the derivative of a function at a given point.
-
-    Parameters
-    ----------
-    func : callable
-        Function to differentiate.
-    u : torch.Tensor
-        Point at which to compute the derivative.
-
-    Returns
-    -------
-    float
-        Derivative value at point u.
-
-    Raises
-    ------
-    ValueError
-        If input tensor doesn't require gradients.
-    """
-    if not u.requires_grad:
-        raise ValueError("Input tensor `u` must have `requires_grad=True`.")
-
-    if u.grad is not None:
-        u.grad.zero_()
-
-    y = func(u)
-    y.backward()
-    derivative = u.grad.item()
-    u.grad.zero_()
-
-    return derivative
-
-
 class _BaseQUTMixin(ABC):
     """Abstract base class for Quantile Universal Threshold (QUT) functionality.
 

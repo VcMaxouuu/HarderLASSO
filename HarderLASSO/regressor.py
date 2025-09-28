@@ -8,6 +8,7 @@ integrated feature selection.
 """
 
 import numpy as np
+from torch import nn
 from typing import Optional, Tuple, Union, List, Any
 from ._base import _BaseHarderLASSOModel
 from ._tasks import _RegressionTaskMixin
@@ -42,6 +43,8 @@ class HarderLASSORegressor(_BaseHarderLASSOModel, _RegressionTaskMixin):
         automatically using QUT.
     penalty : {'harder', 'lasso', 'scad'}, default='harder'
         Type of penalty function for regularization.
+    activation : nn.Module, optional
+        Activation function to use in hidden layers. Defaults to nn.ReLU().
 
     Attributes
     ----------
@@ -84,7 +87,9 @@ class HarderLASSORegressor(_BaseHarderLASSOModel, _RegressionTaskMixin):
         self,
         hidden_dims: Optional[Tuple[int, ...]] = (20,),
         lambda_qut: Optional[float] = None,
-        penalty: str = 'harder'
+        penalty: str = 'harder',
+        activation: Optional[nn.Module] = nn.ReLU(),
+        alpha: float = 0.05
     ):
         """Initialize the HarderLASSO regressor.
 
@@ -96,6 +101,10 @@ class HarderLASSORegressor(_BaseHarderLASSOModel, _RegressionTaskMixin):
             Regularization strength parameter.
         penalty : {'harder', 'lasso', 'scad'}, default='harder'
             Type of regularization penalty to apply.
+        activation : nn.Module, optional
+            Activation function for the hidden layers. Defaults to nn.ReLU().
+        alpha: float, default=0.05
+            Significance level for QUT computation.
         """
         # Initialize base model
         _BaseHarderLASSOModel.__init__(
@@ -103,15 +112,16 @@ class HarderLASSORegressor(_BaseHarderLASSOModel, _RegressionTaskMixin):
             hidden_dims=hidden_dims,
             output_dim=1,
             bias=True,
-            lambda_qut=lambda_qut,
-            penalty=penalty
+            penalty=penalty,
+            activation=activation
         )
 
         # Initialize task-specific functionality
         _RegressionTaskMixin.__init__(self)
 
         # Initialize QUT component
-        self.QUT = _RegressionQUT(lambda_qut=lambda_qut)
+        self.QUT = _RegressionQUT(lambda_qut=lambda_qut, alpha=alpha)
+        self.lambda_qut_ = lambda_qut
 
     def plot_diagnostics(
         self,

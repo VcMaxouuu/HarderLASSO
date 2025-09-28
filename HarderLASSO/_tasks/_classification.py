@@ -5,12 +5,12 @@ interface for the HarderLASSO framework.
 """
 
 import torch
-from numpy import ndarray, asarray, float32, argmax, unique
+from numpy import ndarray, asarray, float32, argmax, unique, exp
 from sklearn.preprocessing import StandardScaler
 from typing import Dict, Tuple, Optional, Union
 
 from ._base import _BaseTaskMixin
-from .._utils import _ClassificationLoss
+from .._utils import _ClassificationLoss, _ClassificationLossBinary
 
 
 class _ClassificationTaskMixin(_BaseTaskMixin):
@@ -35,7 +35,7 @@ class _ClassificationTaskMixin(_BaseTaskMixin):
         """
         super().__init__()
         self.scaler: Optional[StandardScaler] = None
-        self._loss = _ClassificationLoss(reduction='sum')
+        self._loss = None
 
     def preprocess_data(
         self,
@@ -84,10 +84,19 @@ class _ClassificationTaskMixin(_BaseTaskMixin):
                     f"Target should be of shape (n,) or (n, 1). Got: {target.shape}"
                 )
 
-        if hasattr(self._neural_network, '_output_dim'):
-            self._neural_network._output_dim = len(unique(target))
+        n_classes = len(unique(target))
+        is_binary = (n_classes == 2)
 
-        target_tensor = torch.tensor(target, dtype=torch.long)
+        if False:#is_binary:
+            self._loss = _ClassificationLossBinary(reduction='sum')
+            self._neural_network._output_dim = 1
+            target_tensor = torch.tensor(target, dtype=torch.float)
+
+        else:
+            self._loss = _ClassificationLoss(reduction='sum')
+            self._neural_network._output_dim = n_classes
+            target_tensor = torch.tensor(target, dtype=torch.long)
+
         return X_tensor, target_tensor
 
     def criterion(self, outputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -149,5 +158,10 @@ class _ClassificationTaskMixin(_BaseTaskMixin):
         ndarray of shape (n_samples,)
             Class predictions.
         """
-        outputs = raw_outputs.squeeze().cpu().numpy()
-        return argmax(outputs, axis=1)
+        outputs = raw_outputs.detach().cpu()
+        if outputs.ndim == 1:
+            logits = outputs.squeeze()
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).long()
+            return preds.numpy()
+        return argmax(outputs, axis=1).numpy()
