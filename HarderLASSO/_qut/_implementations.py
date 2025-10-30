@@ -173,66 +173,51 @@ class _CoxQUT(_BaseQUTMixin):
         """Simulate QUT values for Cox regression.
 
         Args:
-            X: Input features of shape (n_samples, n_features)
+            X: Input features of shape (n_samples, n_features).
+                Assumes X is already centered around 0.
+
             target: Target with times and events of shape (n_samples, 2)
             n_reps: Number of repetitions for simulation
 
         Returns:
             Simulated QUT values of shape (n_reps,)
-
-
-
-        Code for sorted X at each rep:
-
-        device, dtype = X.device, X.dtype
-        n_samples, n_feat = X.shape
-        times = target[:, 0]
-        events = target[:, 1]
-
-        # Bootstrap sampling
-        pair_boot_idx = torch.randint(
-            0, n_samples, (n_samples, n_reps), dtype=torch.long, device=device
-        )
-        times_boot = times[pair_boot_idx]
-        events_boot = events[pair_boot_idx]  # (n_samples, n_reps)
-
-        sorted_idx = torch.argsort(times_boot, dim=0, descending=True)
-        events = events_boot.gather(0, sorted_idx)
-        X = X.unsqueeze(2).expand(n_samples, n_feat, n_reps).gather(0, sorted_idx.unsqueeze(1).expand(-1, n_feat, -1))
-
-        # Compute cumulative statistics
-        counts = torch.arange(1, n_samples + 1, dtype=dtype, device=device)
-        X.sub_(X.cumsum(0) / counts.view(-1, 1, 1))
-
-        # Compute gradient components
-        grad_nom = torch.linalg.norm((events.unsqueeze(1) * X).sum(0), ord=float("inf"), dim=0)
-        grad_denom = 2 * (events.T.matmul(torch.log(counts))).sqrt()
-
-        quotient = grad_nom / grad_denom.add(1e-10)
-        return quotient
         """
         device, dtype = X.device, X.dtype
-        n_samples, _ = X.shape
+        n_samples, n_feat = X.shape
+
+        if n_samples > 500 :
+            Z = torch.randn(n_reps, n_samples, device=device, dtype=dtype) @ X / torch.sqrt(torch.tensor(n_samples - 1.0))
+            Zmax = Z.abs().max(dim=1).values
+            Lambdas = Zmax / (2 * torch.sqrt(torch.log(torch.tensor(float(n_samples)))))
+            return Lambdas
+
         times = target[:, 0]
         events = target[:, 1]
 
-        pair_boot_idx = torch.randint(
-            0, n_samples, (n_samples, n_reps), dtype=torch.long, device=device
-        )
-        times_boot = times[pair_boot_idx]
-        events_boot = events[pair_boot_idx]
-
-        sorted_idx = torch.argsort(times_boot, dim=0, descending=True)
-        events = events_boot.gather(0, sorted_idx)
-
         counts = torch.arange(1, n_samples + 1, dtype=dtype, device=device)
-        X.sub_(X.cumsum(0) / counts.view(-1, 1))
+        log_counts = torch.log(counts)
 
-        grad_nom = torch.linalg.norm(events.T @ X, ord=float("inf"), dim=1)
-        grad_denom = 2 * (events.T.matmul(torch.log(counts))).sqrt()
+        results = []
 
-        quotient = grad_nom / grad_denom.add(1e-10)
-        return quotient
+        for _ in range(n_reps):
+            boot_idx = torch.randint(0, n_samples, (n_samples,), device=device)
+            times_boot = times[boot_idx]
+            events_boot = events[boot_idx]
+
+            sorted_idx = torch.argsort(times_boot, descending=True)
+            events_boot_sorted = events_boot[sorted_idx]
+
+            perm = torch.randperm(n_samples, device=device)
+            X_perm = X[perm]
+            X_centered_perm = X_perm - torch.cumsum(X_perm, dim=0) / counts.view(-1, 1)
+
+            grad_nom = torch.norm(events_boot_sorted @ X_centered_perm, p=float('inf'))
+            grad_denom = 2 * torch.sqrt(torch.sum(events_boot_sorted * log_counts))
+
+            quotient = grad_nom / (grad_denom + 1e-10)
+            results.append(quotient.item())
+
+        return torch.tensor(results, device=device, dtype=dtype)
 
 
 class _GumbelQUT(_BaseQUTMixin):

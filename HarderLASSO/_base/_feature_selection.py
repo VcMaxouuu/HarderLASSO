@@ -9,7 +9,7 @@ import torch
 import numpy as np
 import warnings
 from typing import List, Optional, Tuple, Dict, Any, Union
-from HarderLASSO._utils import L1Penalty, HarderPenalty, SCADPenalty, MCPenalty, TanhPenalty
+from HarderLASSO._utils import L1Penalty, HarderPenalty
 
 
 class _FeatureSelectionMixin:
@@ -51,11 +51,11 @@ class _FeatureSelectionMixin:
 
         Parameters
         ----------
-        penalty : {'l1', 'harder', 'scad', 'mcp', 'tanh'}, default='harder'
+        penalty : {'l1', 'harder'}, default='harder'
             Type of penalty to apply.
         """
-        if penalty not in ['l1', 'harder', 'scad', 'mcp', 'tanh']:
-            raise ValueError(f"Penalty must be one of ['l1', 'harder', 'scad', 'mcp', 'tanh'], got {penalty}")
+        if penalty not in ['l1', 'harder']:
+            raise ValueError(f"Penalty must be one of ['l1', 'harder'], got {penalty}")
 
         if not hasattr(self, '_neural_network'):
             raise ValueError(
@@ -67,12 +67,6 @@ class _FeatureSelectionMixin:
             self.penalty = L1Penalty()
         elif penalty == 'harder':
             self.penalty = HarderPenalty()
-        elif penalty == 'scad':
-            self.penalty = SCADPenalty()
-        elif penalty == 'mcp':
-            self.penalty = MCPenalty()
-        elif penalty == 'tanh':
-            self.penalty = TanhPenalty()
         else:
             raise ValueError(f"Unsupported penalty type: {penalty}")
 

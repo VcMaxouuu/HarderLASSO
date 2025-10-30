@@ -7,7 +7,7 @@ the multi-phase training strategy for HarderLASSO models.
 
 import torch
 from typing import List, Any, Optional
-from ._optimizer import _ISTAOptimizer
+from ._optimizer import _ISTAOptimizer, _FISTAOptimizer
 from ._callbacks import _ConvergenceChecker, _LoggingCallback
 from .._utils import HarderPenalty, SCADPenalty, MCPenalty
 
@@ -167,9 +167,10 @@ class _FeatureSelectionTrainer:
             if not penalized_params:
                 raise ValueError(f"No penalized parameters found for ISTA phase {phase_idx + 1}")
 
-            ISTA_optimizer = _ISTAOptimizer([
+
+            ISTA_optimizer = _FISTAOptimizer([
                 {'params': penalized_params, 'penalty': self.model.penalty},
-                {'params': unpenalized_params}
+                #{'params': unpenalized_params}
             ], lr=0.01, lambda_=lambda_val)
 
         else:
@@ -187,7 +188,7 @@ class _FeatureSelectionTrainer:
             relative_tolerance = 1e-4
             max_epochs = 1000
         elif is_final_phase:
-            relative_tolerance = 1e-10
+            relative_tolerance = 1e-8
             max_epochs = None
         else:
             relative_tolerance = 1e-6
@@ -214,7 +215,7 @@ class _FeatureSelectionTrainer:
             return total_loss, bare_loss
 
         while True:
-            if is_final_phase and isinstance(ISTA_optimizer, _ISTAOptimizer):
+            if is_final_phase:
                 total_loss, bare_loss = ISTA_optimizer.step(closure)
             else:
                 optimizer.zero_grad()

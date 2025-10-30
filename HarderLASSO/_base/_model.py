@@ -232,7 +232,6 @@ class _BaseHarderLASSOModel(_FeatureSelectionMixin):
         # Setup model architecture
         self._setup_model(X_tensor.shape[1])
 
-
         if not hasattr(self, 'QUT'):
             raise ValueError("QUT component required for lambda path computation.")
 

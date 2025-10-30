@@ -282,21 +282,18 @@ class SCADPenalty(BasePenalty):
         lr = kwargs.get('lr', 0.01)
         a = kwargs.get('a', self.params.get('a', 3.7))
 
-        lr_lambda = lambda_ * lr
-
-        if lr_lambda == 0:
+        if lambda_ == 0:
             return parameter
 
         result = torch.zeros_like(parameter)
         abs_u = parameter.abs()
 
-        mask1 = (abs_u > lr_lambda) & (abs_u <= 2 * lr_lambda)
-        result[mask1] = (torch.sign(parameter[mask1]) * (abs_u[mask1] - lr_lambda))
+        mask1 = abs_u <= lambda_ * (1 + lr)
+        mask2 = (abs_u > lambda_ * (1 + lr)) & (abs_u <= a * lambda_)
+        mask3 = abs_u > a * lambda_
 
-        mask2 = (abs_u > 2 * lr_lambda) & (abs_u <= a * lr_lambda)
-        result[mask2] = torch.sign(parameter[mask2]) * ((a - 1) * abs_u[mask2] - a * lr_lambda) / (a - 2)
-
-        mask3 = abs_u > a * lr_lambda
+        result[mask1] = torch.sign(parameter[mask1]) * torch.relu(abs_u[mask1] - lr * lambda_)
+        result[mask2] = ((a - 1) * parameter[mask2] - torch.sign(parameter[mask2]) * a * lr * lambda_) / (a - 1 - lr)
         result[mask3] = parameter[mask3]
 
         return result
